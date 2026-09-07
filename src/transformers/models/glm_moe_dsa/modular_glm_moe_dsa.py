@@ -65,6 +65,15 @@ class GlmMoeDsaConfig(DeepseekV32Config):
         Per-layer indexer mode (`"full"` runs the indexer, `"shared"` reuses the previous full
         layer's top-k). Defaults to the pattern derived from `index_topk_freq` /
         `index_skip_topk_offset` (or `index_topk_pattern`).
+    index_num_clusters (`int`, *optional*, defaults to 512):
+        Number of K-Means clusters built over the indexer key cache for IVF top-k selection.
+    index_num_probes (`int`, *optional*, defaults to 64):
+        Number of clusters each query probes. The scanned fraction of the key cache is roughly
+        `index_num_probes / index_num_clusters`; setting the two equal recovers exact top-k.
+    index_kmeans_iters (`int`, *optional*, defaults to 10):
+        Number of K-Means iterations run when (re)building the index.
+    index_kmeans_seed (`int`, *optional*, defaults to 0):
+        Seed for K-Means centroid initialization, so clusterings are reproducible.
 
     ```python
     >>> from transformers import GlmMoeDsaConfig, GlmMoeDsaModel
@@ -104,6 +113,11 @@ class GlmMoeDsaConfig(DeepseekV32Config):
     index_n_heads: int = 32
     # `"full"` runs the indexer, `"shared"` reuses the previous full layer's index mask.
     indexer_types: list[str] | None = None
+    # IVF / K-Means top-k selection in the indexer (see `GlmMoeDsaIndexer`).
+    index_num_clusters: int = 512
+    index_num_probes: int = 64
+    index_kmeans_iters: int = 10
+    index_kmeans_seed: int = 0
 
     def __post_init__(self, **kwargs):
         # Per-layer indexer mode: a pattern (e.g. `"FSSF..."`) overrides the freq/offset schedule.
@@ -128,6 +142,80 @@ class GlmMoeDsaRMSNorm(DeepseekV3RMSNorm):
 
 class GlmMoeDsaRotaryEmbedding(DeepseekV32RotaryEmbedding):
     pass
+
+
+def _kmeans_cosine(
+    keys: torch.Tensor,
+    key_valid: torch.Tensor,
+    num_clusters: int,
+    num_iters: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Cluster indexer keys by cosine similarity, batched over the sequence dimension.
+
+    Keys are assigned to the centroid they are most cosine-similar to, but each centroid is the
+    L2-normalized mean of the **raw** keys assigned to it. Empty clusters keep their previous
+    centroid instead of collapsing to the origin. Padding keys are kept out of the initial sample
+    and out of the centroid means, but are still assigned, so `cluster_of_key` covers the whole
+    cache; they are masked out of the scores downstream anyway.
+
+    Args:
+        keys: Indexer key cache `[B, T, D]`.
+        key_valid: `True` for real tokens, `False` for padding, shape `[B, T]`.
+        num_clusters: Number of clusters `C`; must be `<= T`.
+        num_iters: Number of assign/update iterations.
+        seed: Seed for centroid initialization, so clusterings are reproducible.
+
+    Returns:
+        `tuple[torch.Tensor, torch.Tensor]`: unit-normalized FP32 centroids `[B, C, D]`, and the
+            `int64` cluster index of every key, `[B, T]`.
+    """
+    keys = keys.float()
+    head_dim = keys.shape[-1]
+    keys_norm = F.normalize(keys, p=2, dim=-1)
+    valid = key_valid.unsqueeze(-1).to(keys.dtype)  # [B, T, 1]
+    keys_valid = keys * valid  # loop-invariant: padding must not move the centroid means
+
+    # Seed the centroids with `num_clusters` distinct keys. Padding sorts last, so it is only drawn
+    # when a sequence holds fewer real tokens than there are clusters.
+    generator = torch.Generator(device=keys.device).manual_seed(seed)
+    order = torch.rand(keys.shape[:2], generator=generator, device=keys.device)
+    order = order.masked_fill(~key_valid, float("inf")).topk(num_clusters, dim=-1, largest=False).indices
+    centroids = keys_norm.gather(1, order.unsqueeze(-1).expand(-1, -1, head_dim))
+
+    for _ in range(num_iters):
+        assignments = torch.matmul(keys_norm, centroids.transpose(-1, -2)).argmax(dim=-1)  # [B, T]
+        sums = torch.zeros_like(centroids).scatter_add_(
+            1, assignments.unsqueeze(-1).expand(-1, -1, head_dim), keys_valid
+        )
+        counts = torch.zeros_like(centroids[..., :1]).scatter_add_(1, assignments.unsqueeze(-1), valid)
+        means = F.normalize(sums / counts.clamp_min(1.0), p=2, dim=-1)
+        centroids = torch.where(counts > 0, means, centroids)
+
+    assignments = torch.matmul(keys_norm, centroids.transpose(-1, -2)).argmax(dim=-1)
+    return centroids, assignments
+
+
+def _reorder_by_cluster(cluster_of_key: torch.Tensor, num_clusters: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Lay the keys out cluster by cluster so each cluster occupies one contiguous range.
+
+    Args:
+        cluster_of_key: Cluster index of every key, `[B, T]`.
+        num_clusters: Number of clusters `C`.
+
+    Returns:
+        `tuple[torch.Tensor, torch.Tensor]`: `reordered_indices` `[B, T]`, mapping a slot in the
+            cluster-contiguous layout back to its key position in the cache, and `cluster_offsets`
+            `[B, C + 1]`, where cluster `c` owns slots `[offsets[c], offsets[c + 1])`.
+    """
+    reordered_indices = cluster_of_key.argsort(dim=-1, stable=True)
+    counts = torch.zeros(
+        cluster_of_key.shape[0], num_clusters, dtype=torch.long, device=cluster_of_key.device
+    ).scatter_add_(1, cluster_of_key, torch.ones_like(cluster_of_key))
+    cluster_offsets = F.pad(counts.cumsum(dim=-1), (1, 0))
+    return reordered_indices, cluster_offsets
 
 
 class GlmMoeDsaIndexer(DeepseekV32Indexer):
@@ -192,6 +280,224 @@ class GlmMoeDsaIndexer(DeepseekV32Indexer):
         return index_scores.topk(topk, dim=-1).indices.to(torch.int32)  # [B, S, topk]
 
 
+class GlmMoeDsaKmeansIndexer(GlmMoeDsaIndexer):
+    """
+    [`GlmMoeDsaIndexer`] with IVF top-k selection instead of a scan over the whole key cache.
+
+    K-Means over the indexer keys partitions the cache into `index_num_clusters` clusters, laid out
+    so each cluster is contiguous. A query scores the centroids, probes the `index_num_probes` best
+    ones, and **only the keys inside those clusters are ever scored** — the full `[B, S, H, T]` score
+    matrix of the dense indexer is never built. The scoring function itself is unchanged, so this
+    narrows which keys compete for the top-k and `index_num_probes == index_num_clusters` recovers
+    the exact result.
+
+    The index is rebuilt on any multi-token forward and on a cache reset; during decode the appended
+    keys are assigned to their nearest existing centroid, which leaves the centroids fixed between
+    rebuilds.
+    """
+
+    def __init__(self, config: GlmMoeDsaConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        self.num_clusters: int = config.index_num_clusters
+        self.num_probes: int = config.index_num_probes
+        self.kmeans_iters: int = config.index_kmeans_iters
+        self.kmeans_seed: int = config.index_kmeans_seed
+        # Per-sequence scratch derived from the key cache, deliberately plain attributes rather than
+        # buffers so they stay out of `state_dict`.
+        self.centroids: torch.Tensor | None = None
+        self.reordered_indices: torch.Tensor | None = None
+        self.cluster_offsets: torch.Tensor | None = None
+        self.indexed_len: int = 0
+
+    def _refresh_index(self, keys: torch.Tensor, key_valid: torch.Tensor, seq_len: int) -> None:
+        """
+        Bring the IVF index in sync with the indexer key cache `[B, T, D]`.
+
+        Rebuilds from scratch on a multi-token forward, on the first call, or whenever the cache no
+        longer matches what was indexed (a shorter cache means a new sequence). Otherwise the single
+        appended key is assigned to its nearest existing centroid and spliced into the layout, which
+        leaves the centroids themselves fixed between rebuilds.
+        """
+        total_len = keys.shape[1]
+        num_clusters = min(self.num_clusters, total_len)
+        stale = (
+            self.centroids is None
+            or seq_len > 1
+            or total_len < self.indexed_len
+            or self.centroids.shape[0] != keys.shape[0]
+            or self.centroids.shape[1] != num_clusters
+            or self.centroids.device != keys.device
+        )
+        if stale:
+            self.centroids, cluster_of_key = _kmeans_cosine(
+                keys, key_valid, num_clusters, self.kmeans_iters, self.kmeans_seed
+            )
+            self.reordered_indices, self.cluster_offsets = _reorder_by_cluster(cluster_of_key, num_clusters)
+        elif total_len > self.indexed_len:
+            self._append_key(keys)
+        self.indexed_len = total_len
+
+    def _append_key(self, keys: torch.Tensor) -> None:
+        """Assign the newly cached key to its nearest centroid and splice it into the layout."""
+        position = keys.shape[1] - 1
+        new_key = F.normalize(keys[:, position:].float(), p=2, dim=-1)  # [B, 1, D]
+        cluster = torch.matmul(new_key, self.centroids.transpose(-1, -2)).argmax(dim=-1)  # [B, 1]
+
+        # The key lands at the end of its cluster's range; everything after it shifts one slot right.
+        slot = self.cluster_offsets.gather(-1, cluster + 1)  # [B, 1]
+        old = torch.arange(position, device=keys.device).unsqueeze(0)  # [1, T]
+        shifted = torch.empty((keys.shape[0], position + 1), dtype=self.reordered_indices.dtype, device=keys.device)
+        shifted.scatter_(1, old + (old >= slot).long(), self.reordered_indices)
+        self.reordered_indices = shifted.scatter_(1, slot, position)
+
+        bumped = torch.arange(self.cluster_offsets.shape[1], device=keys.device).unsqueeze(0) > cluster
+        self.cluster_offsets = self.cluster_offsets + bumped.long()
+
+    def _probe(self, q: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """
+        Pick the clusters each query searches, `[B, S, P]`.
+
+        Cluster scoring mirrors the per-key path — every head scores the centroids, the scores are
+        ReLU'd, and the same per-head weights combine them — so all heads of a query agree on one
+        shared set of probed clusters. Routing is by cosine similarity, unlike the raw dot product
+        that ranks the keys themselves.
+        """
+        num_probes = min(self.num_probes, self.centroids.shape[1])
+        cluster_scores = torch.matmul(q, self.centroids.unsqueeze(1).transpose(-1, -2))  # [B, S, H, C]
+        cluster_scores = F.relu(cluster_scores)
+
+        # Combine across heads exactly as the key scores are combined: [B, S, 1, H] @ [B, S, H, C]
+        probe_scores = torch.matmul(weights.unsqueeze(-2), cluster_scores).squeeze(-2)  # [B, S, C]
+        return probe_scores.topk(num_probes, dim=-1).indices
+
+    def _gather_candidates(self, probes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Expand probed clusters into the key indices they contain.
+
+        Each probed cluster gets its own slot of `L` entries, `L` being the widest cluster this
+        batch probes, so a query's candidates live in a `[P, L]` block that is simply flattened —
+        clusters shorter than `L` leave their tail unfilled. Sizing by the widest cluster rather than by a running candidate total keeps
+        the layout a direct image of "probe `P` clusters".
+
+        Args:
+            probes: Clusters probed by each query, `[B, S, P]`.
+
+        Returns:
+            `tuple[torch.Tensor, torch.Tensor]`: candidate key indices `[B, S, P * L]` and a bool
+                mask marking the slots that hold a real candidate.
+        """
+        batch_size, seq_len = probes.shape[:2]
+        offsets = self.cluster_offsets.unsqueeze(1).expand(batch_size, seq_len, -1)
+        starts = offsets.gather(-1, probes)  # [B, S, P] first slot of each probed cluster
+        sizes = offsets.gather(-1, probes + 1) - starts
+
+        # Slot width is the widest cluster this batch actually probes, read off the device so it
+        # is exact rather than an upper bound that drifts as decode grows the clusters. At least one
+        # slot is kept so a query probing only empty clusters still yields a well-formed buffer.
+        within = torch.arange(max(int(sizes.max()), 1), device=probes.device)  # [L]
+        position = (starts.unsqueeze(-1) + within).flatten(2)  # [B, S, P * L]
+        filled = (within < sizes.unsqueeze(-1)).flatten(2)
+
+        layout = self.reordered_indices.unsqueeze(1).expand(batch_size, seq_len, -1)
+        cache_len = layout.shape[-1]
+        candidates = layout.gather(-1, position.clamp(max=cache_len - 1))
+
+        # Candidates stay in cluster order. Ordering them by cache position would only change which
+        # of several equally-scoring (ReLU-zeroed) keys wins a tie, and costs an O(M log M) sort.
+        return candidates.clamp(max=cache_len - 1), filled
+
+    @torch.no_grad()
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        q_resid: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,  # Kept for BC
+        past_key_values: Cache | None = None,
+    ) -> torch.Tensor:
+        """
+        Selects the top-k tokens per query for DeepSeek Sparse Attention (DSA).
+
+        Same as [`GlmMoeDsaIndexer.forward`], but the top-k is taken over the keys inside the
+        probed clusters rather than over the whole key cache.
+
+        Args:
+            hidden_states: Input hidden states `[B, S, hidden_size]`.
+            q_resid: Query residual from `q_a_layernorm(q_a_proj(x))`, shape `[B, S, q_lora_rank]`.
+            position_embeddings: `(cos, sin)` from RotaryEmbedding.
+            attention_mask: Causal mask, broadcastable to `[B, S, T]`.
+            past_key_values: Cache object containing the indexer key cache for this layer.
+
+        Returns:
+            `torch.Tensor`: the `int32` top-k token indices of shape `[B, S, topk]`. The eager / SDPA paths
+                turn these into an additive sparse mask; the `flash-mla` kernel consumes them directly.
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        cos, sin = position_embeddings
+        q = self.wq_b(q_resid)  # [B, S, H*D]
+        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)  # [B, S, H, D]
+        q_rot, q_pass = torch.split(q, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
+
+        k = self.k_norm(self.wk(hidden_states)).unsqueeze(2)  # [B, S, 1, D]
+        k_rot, k_pass = torch.split(k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
+
+        # GLM-MoE-DSA uses interleaved RoPE in the indexer
+        q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
+        q = torch.cat([q_rot, q_pass], dim=-1)  # [B, S, H, D]
+        k = torch.cat([k_rot, k_pass], dim=-1).squeeze(2)  # [B, S, D]
+
+        if past_key_values is not None:
+            k = past_key_values.update_indexer(k, self.layer_idx)
+
+        weights = self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype)).float() * (self.n_heads**-0.5)
+        q, k = q.float(), k.float()
+        cache_len = k.shape[1]
+
+        # A key is real if the last query — which sees the whole cache — is allowed to attend to it.
+        if attention_mask.dtype == torch.bool:
+            key_valid = attention_mask[:, -1]
+        else:
+            key_valid = attention_mask[:, -1] > torch.finfo(attention_mask.dtype).min / 2
+
+        self._refresh_index(k, key_valid, seq_len)
+        probes = self._probe(F.normalize(q, p=2, dim=-1), weights)
+        candidates, filled = self._gather_candidates(probes)  # [B, S, M]
+
+        # Score only the probed keys: [B, S, M, D] gathered, then [B, S, H, D] @ [B, S, D, M].
+        candidate_keys = (
+            k.unsqueeze(1)
+            .expand(-1, seq_len, -1, -1)
+            .gather(2, candidates.unsqueeze(-1).expand(-1, -1, -1, k.shape[-1]))
+        )
+        scores = torch.matmul(q, candidate_keys.transpose(-1, -2)) * self.softmax_scale
+        scores = F.relu(scores)
+
+        # Weight per head and sum across heads: [B, S, 1, H] @ [B, S, H, M] → [B, S, M]
+        index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
+
+        # Drop padding slots, padding keys, and keys the query may not look back at, mirroring the
+        # causal filter the dense indexer gets from `attention_mask`.
+        query_pos = torch.arange(cache_len - seq_len, cache_len, device=k.device).view(1, seq_len, 1)
+        allowed = filled & (candidates <= query_pos)
+        allowed &= key_valid.unsqueeze(1).expand(-1, seq_len, -1).gather(-1, candidates)
+        index_scores = index_scores.masked_fill_(~allowed, float("-inf"))
+
+        # Unfilled ranks repeat an already-selected key: `scatter` is idempotent, so a duplicate adds
+        # nothing, whereas an arbitrary index would hand the query a key it never selected.
+        # The contract is `min(index_topk, T)` columns. Uneven clusters can make the padded
+        # candidate buffer wider than the cache, so the rank count is clamped to the contract too.
+        width = min(self.index_topk, cache_len)
+        top_scores, top_slots = index_scores.topk(min(width, candidates.shape[-1]), dim=-1)
+        selected = candidates.gather(-1, top_slots)
+        fallback = torch.where(top_scores[..., :1] > float("-inf"), selected[..., :1], query_pos)
+        selected = torch.where(top_scores > float("-inf"), selected, fallback)
+
+        if selected.shape[-1] < width:
+            selected = torch.cat([selected, fallback.expand(-1, -1, width - selected.shape[-1])], dim=-1)
+        return selected.to(torch.int32)  # [B, S, topk]
+
+
 class GlmMoeDsaAttention(DeepseekV3Attention):
     """
     DeepSeek-V3 MLA + a DSA indexer, extended with **cross-layer top-k sharing**.
@@ -206,7 +512,7 @@ class GlmMoeDsaAttention(DeepseekV3Attention):
         super().__init__(config, layer_idx)
         # Refer: https://arxiv.org/abs/2603.12201 for more details.
         self.skip_topk = config.indexer_types[layer_idx] == "shared"
-        self.indexer = None if self.skip_topk else GlmMoeDsaIndexer(config, layer_idx)
+        self.indexer = None if self.skip_topk else GlmMoeDsaKmeansIndexer(config, layer_idx)
 
     def forward(
         self,

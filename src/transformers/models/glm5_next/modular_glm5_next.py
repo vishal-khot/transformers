@@ -107,6 +107,15 @@ class Glm5NextTextConfig(GlmMoeDsaConfig):
     indexer_types (`list[str]`, *optional*):
         Per-layer DSA indexer mode. Values are `"full"` (run the indexer) or `"shared"`
         (reuse the previous full layer's top-k selection).
+    index_num_clusters (`int`, *optional*, defaults to 512):
+        Number of K-Means clusters for IVF top-k selection. Inherited from [`GlmMoeDsaConfig`] and
+        unused here: [`Glm5NextTextIndexer`] selects through k-pool compression instead.
+    index_num_probes (`int`, *optional*, defaults to 64):
+        Number of clusters each query probes. Inherited and unused, see `index_num_clusters`.
+    index_kmeans_iters (`int`, *optional*, defaults to 10):
+        Number of K-Means iterations. Inherited and unused, see `index_num_clusters`.
+    index_kmeans_seed (`int`, *optional*, defaults to 0):
+        Seed for K-Means centroid initialization. Inherited and unused, see `index_num_clusters`.
     swiglu_limit (`float`, *optional*, defaults to 10.0):
         Clamp limit applied to SwiGLU gate/up projections.
     linear_head_dim (`int`, *optional*, defaults to 128):
