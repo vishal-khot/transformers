@@ -107,15 +107,6 @@ class Glm5NextTextConfig(GlmMoeDsaConfig):
     indexer_types (`list[str]`, *optional*):
         Per-layer DSA indexer mode. Values are `"full"` (run the indexer) or `"shared"`
         (reuse the previous full layer's top-k selection).
-    index_num_clusters (`int`, *optional*, defaults to 512):
-        Number of K-Means clusters for IVF top-k selection. Inherited from [`GlmMoeDsaConfig`] and
-        unused here: [`Glm5NextTextIndexer`] selects through k-pool compression instead.
-    index_num_probes (`int`, *optional*, defaults to 64):
-        Number of clusters each query probes. Inherited and unused, see `index_num_clusters`.
-    index_kmeans_iters (`int`, *optional*, defaults to 10):
-        Number of K-Means iterations. Inherited and unused, see `index_num_clusters`.
-    index_kmeans_seed (`int`, *optional*, defaults to 0):
-        Seed for K-Means centroid initialization. Inherited and unused, see `index_num_clusters`.
     swiglu_limit (`float`, *optional*, defaults to 10.0):
         Clamp limit applied to SwiGLU gate/up projections.
     linear_head_dim (`int`, *optional*, defaults to 128):
@@ -136,6 +127,16 @@ class Glm5NextTextConfig(GlmMoeDsaConfig):
         Pool size of the compressed token groups selected by the DSA indexer.
     index_kpool_always_select_tail (`bool`, *optional*, defaults to `True`):
         Whether the incomplete KPool tail is always included in sparse attention.
+    index_num_clusters (`int`, *optional*, defaults to 512):
+        Number of K-Means clusters built over the indexer key cache for IVF top-k selection
+        (see [`Glm5NextTextKmeansIndexer`]).
+    index_num_probes (`int`, *optional*, defaults to 64):
+        Number of clusters each query probes. The scanned fraction of the key cache is roughly
+        `index_num_probes / index_num_clusters`; setting the two equal recovers exact top-k.
+    index_kmeans_iters (`int`, *optional*, defaults to 10):
+        Number of K-Means iterations run when (re)building the index.
+    index_kmeans_seed (`int`, *optional*, defaults to 0):
+        Seed for K-Means centroid initialization, so clusterings are reproducible.
     """
 
     model_type = "glm5_next_text"
@@ -172,6 +173,11 @@ class Glm5NextTextConfig(GlmMoeDsaConfig):
 
     index_kpool: int = 16
     index_kpool_always_select_tail: bool = True
+    # IVF / K-Means top-k selection in the indexer (see `Glm5NextTextKmeansIndexer`).
+    index_num_clusters: int = 512
+    index_num_probes: int = 64
+    index_kmeans_iters: int = 10
+    index_kmeans_seed: int = 0
 
     mlp_bias = AttributeError()
     rope_parameters = AttributeError()
@@ -755,6 +761,83 @@ class Glm5NextTextLinearAttention(nn.Module):
         return output
 
 
+def _kmeans_cosine(
+    keys: torch.Tensor,
+    key_valid: torch.Tensor,
+    num_clusters: int,
+    num_iters: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Cluster indexer keys by cosine similarity, batched over the sequence dimension.
+
+    Keys are assigned to the centroid they are most cosine-similar to, but each centroid is the
+    L2-normalized mean of the **raw** keys assigned to it. Empty clusters keep their previous
+    centroid instead of collapsing to the origin. Padding keys are kept out of the initial sample
+    and out of the centroid means, but are still assigned, so `cluster_of_key` covers the whole
+    cache; they are masked out of the scores downstream anyway.
+
+    Args:
+        keys: Indexer key cache `[B, T, D]`.
+        key_valid: `True` for real tokens, `False` for padding, shape `[B, T]`.
+        num_clusters: Number of clusters `C`; must be `<= T`.
+        num_iters: Number of assign/update iterations.
+        seed: Seed for centroid initialization, so clusterings are reproducible.
+
+    Returns:
+        `tuple[torch.Tensor, torch.Tensor]`: unit-normalized FP32 centroids `[B, C, D]`, and the
+            `int64` cluster index of every key, `[B, T]`.
+    """
+    keys = keys.float()
+    head_dim = keys.shape[-1]
+    keys_norm = F.normalize(keys, p=2, dim=-1)
+    valid = key_valid.unsqueeze(-1).to(keys.dtype)  # [B, T, 1]
+    keys_valid = keys * valid  # loop-invariant: padding must not move the centroid means
+
+    # Seed the centroids with `num_clusters` distinct keys. Padding sorts last, so it is only drawn
+    # when a sequence holds fewer real tokens than there are clusters. One ordering is drawn over
+    # positions and shared by the batch: drawing `[B, T]` instead would offset each row into the
+    # generator stream, so a sequence would cluster differently depending on where it sat in the
+    # batch. Rows still diverge from here, through their own keys and their own padding.
+    generator = torch.Generator(device=keys.device).manual_seed(seed)
+    order = torch.rand(keys.shape[1], generator=generator, device=keys.device).expand(keys.shape[0], -1)
+    order = order.masked_fill(~key_valid, float("inf")).topk(num_clusters, dim=-1, largest=False).indices
+    centroids = keys_norm.gather(1, order.unsqueeze(-1).expand(-1, -1, head_dim))
+
+    for _ in range(num_iters):
+        assignments = torch.matmul(keys_norm, centroids.transpose(-1, -2)).argmax(dim=-1)  # [B, T]
+        sums = torch.zeros_like(centroids).scatter_add_(
+            1, assignments.unsqueeze(-1).expand(-1, -1, head_dim), keys_valid
+        )
+        counts = torch.zeros_like(centroids[..., :1]).scatter_add_(1, assignments.unsqueeze(-1), valid)
+        means = F.normalize(sums / counts.clamp_min(1.0), p=2, dim=-1)
+        centroids = torch.where(counts > 0, means, centroids)
+
+    assignments = torch.matmul(keys_norm, centroids.transpose(-1, -2)).argmax(dim=-1)
+    return centroids, assignments
+
+
+def _reorder_by_cluster(cluster_of_key: torch.Tensor, num_clusters: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Lay the keys out cluster by cluster so each cluster occupies one contiguous range.
+
+    Args:
+        cluster_of_key: Cluster index of every key, `[B, T]`.
+        num_clusters: Number of clusters `C`.
+
+    Returns:
+        `tuple[torch.Tensor, torch.Tensor]`: `reordered_indices` `[B, T]`, mapping a slot in the
+            cluster-contiguous layout back to its key position in the cache, and `cluster_offsets`
+            `[B, C + 1]`, where cluster `c` owns slots `[offsets[c], offsets[c + 1])`.
+    """
+    reordered_indices = cluster_of_key.argsort(dim=-1, stable=True)
+    counts = torch.zeros(
+        cluster_of_key.shape[0], num_clusters, dtype=torch.long, device=cluster_of_key.device
+    ).scatter_add_(1, cluster_of_key, torch.ones_like(cluster_of_key))
+    cluster_offsets = F.pad(counts.cumsum(dim=-1), (1, 0))
+    return reordered_indices, cluster_offsets
+
+
 class Glm5NextTextIndexer(GlmMoeDsaIndexer):
     """
     DeepSeek Sparse Attention (DSA) indexer with k-pool compression for GLM-5.3-Flash.
@@ -1031,6 +1114,228 @@ class Glm5NextTextIndexer(GlmMoeDsaIndexer):
         return torch.cat([topk_indices, tail_indices], dim=-1)
 
 
+class Glm5NextTextKmeansIndexer(Glm5NextTextIndexer):
+    """
+    [`Glm5NextTextIndexer`] with IVF top-k selection instead of k-pool compression.
+
+    The k-pool indexer groups keys into fixed, position-contiguous pools of `index_kpool` tokens and
+    scores one pooled key per group. This indexer instead partitions the cache by **content**:
+    K-Means over the indexer keys builds `index_num_clusters` clusters, laid out so each cluster is
+    contiguous. A query scores the centroids, probes the `index_num_probes` best ones, and only the
+    keys inside those clusters are ever scored, at full per-token resolution. Setting
+    `index_num_probes == index_num_clusters` recovers the exact dense top-k.
+
+    Unlike the k-pool path there is no forced recency tail: candidates come purely from probing.
+
+    The index is rebuilt on any multi-token forward and on a cache reset; during decode the appended
+    key is assigned to its nearest existing centroid, which leaves the centroids fixed between
+    rebuilds.
+
+    **Weights**: this module adds no parameters of its own, and `index_kpool_compress_ape` goes
+    unused, so a k-pool checkpoint loads into it with nothing randomly initialized.
+    """
+
+    def __init__(self, config: Glm5NextTextConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        self.num_clusters: int = config.index_num_clusters
+        self.num_probes: int = config.index_num_probes
+        self.kmeans_iters: int = config.index_kmeans_iters
+        self.kmeans_seed: int = config.index_kmeans_seed
+        # Per-sequence scratch derived from the key cache, deliberately plain attributes rather than
+        # buffers so they stay out of `state_dict`.
+        self.centroids: torch.Tensor | None = None
+        self.reordered_indices: torch.Tensor | None = None
+        self.cluster_offsets: torch.Tensor | None = None
+        self.indexed_len: int = 0
+
+    def _refresh_index(self, keys: torch.Tensor, key_valid: torch.Tensor, seq_len: int, current_length: int) -> None:
+        """
+        Bring the IVF index in sync with the first `current_length` entries of the key cache.
+
+        Rebuilds from scratch on a multi-token forward, on the first call, or whenever the cache no
+        longer matches what was indexed (a shorter cache means a new sequence). Otherwise the single
+        appended key is assigned to its nearest existing centroid and spliced into the layout, which
+        leaves the centroids themselves fixed between rebuilds. Indexing the written prefix rather
+        than the whole tensor keeps static caches, whose tail is preallocated, out of the index.
+        """
+        num_clusters = min(self.num_clusters, current_length)
+        stale = (
+            self.centroids is None
+            or seq_len > 1
+            or current_length < self.indexed_len
+            or self.centroids.shape[0] != keys.shape[0]
+            or self.centroids.shape[1] != num_clusters
+            or self.centroids.device != keys.device
+        )
+        if stale:
+            self.centroids, cluster_of_key = _kmeans_cosine(
+                keys[:, :current_length],
+                key_valid[:, :current_length],
+                num_clusters,
+                self.kmeans_iters,
+                self.kmeans_seed,
+            )
+            self.reordered_indices, self.cluster_offsets = _reorder_by_cluster(cluster_of_key, num_clusters)
+        elif current_length > self.indexed_len:
+            self._append_key(keys, current_length - 1)
+        self.indexed_len = current_length
+
+    def _append_key(self, keys: torch.Tensor, position: int) -> None:
+        """Assign the newly cached key to its nearest centroid and splice it into the layout."""
+        new_key = F.normalize(keys[:, position : position + 1].float(), p=2, dim=-1)  # [B, 1, D]
+        cluster = torch.matmul(new_key, self.centroids.transpose(-1, -2)).argmax(dim=-1)  # [B, 1]
+
+        # The key lands at the end of its cluster's range; everything after it shifts one slot right.
+        slot = self.cluster_offsets.gather(-1, cluster + 1)  # [B, 1]
+        old = torch.arange(position, device=keys.device).unsqueeze(0)  # [1, T]
+        shifted = torch.empty((keys.shape[0], position + 1), dtype=self.reordered_indices.dtype, device=keys.device)
+        shifted.scatter_(1, old + (old >= slot).long(), self.reordered_indices)
+        self.reordered_indices = shifted.scatter_(1, slot, position)
+
+        bumped = torch.arange(self.cluster_offsets.shape[1], device=keys.device).unsqueeze(0) > cluster
+        self.cluster_offsets = self.cluster_offsets + bumped.long()
+
+    def _probe(self, q: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """
+        Pick the clusters each query searches, `[B, S, P]`.
+
+        Cluster scoring mirrors the per-key path — every head scores the centroids, the scores are
+        ReLU'd, and the same per-head weights combine them — so all heads of a query agree on one
+        shared set of probed clusters. Routing is by cosine similarity, unlike the raw dot product
+        that ranks the keys themselves.
+        """
+        num_probes = min(self.num_probes, self.centroids.shape[1])
+        cluster_scores = torch.matmul(q, self.centroids.unsqueeze(1).transpose(-1, -2))  # [B, S, H, C]
+        cluster_scores = F.relu(cluster_scores)
+
+        # Combine across heads exactly as the key scores are combined: [B, S, 1, H] @ [B, S, H, C]
+        probe_scores = torch.matmul(weights.unsqueeze(-2), cluster_scores).squeeze(-2)  # [B, S, C]
+        return probe_scores.topk(num_probes, dim=-1).indices
+
+    def _gather_candidates(self, probes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Expand probed clusters into the key indices they contain.
+
+        Each probed cluster gets its own slot of `L` entries, `L` being the widest cluster this
+        batch probes, so a query's candidates live in a `[P, L]` block that is simply flattened —
+        clusters shorter than `L` leave their tail unfilled. Sizing by the widest cluster rather
+        than by a running candidate total keeps the layout a direct image of "probe `P` clusters".
+
+        Args:
+            probes: Clusters probed by each query, `[B, S, P]`.
+
+        Returns:
+            `tuple[torch.Tensor, torch.Tensor]`: candidate key indices `[B, S, P * L]` and a bool
+                mask marking the slots that hold a real candidate.
+        """
+        batch_size, seq_len = probes.shape[:2]
+        offsets = self.cluster_offsets.unsqueeze(1).expand(batch_size, seq_len, -1)
+        starts = offsets.gather(-1, probes)  # [B, S, P] first slot of each probed cluster
+        sizes = offsets.gather(-1, probes + 1) - starts
+
+        # Slot width is the widest cluster this batch actually probes, read off the device so it
+        # is exact rather than an upper bound that drifts as decode grows the clusters. At least one
+        # slot is kept so a query probing only empty clusters still yields a well-formed buffer.
+        within = torch.arange(max(int(sizes.max()), 1), device=probes.device)  # [L]
+        position = (starts.unsqueeze(-1) + within).flatten(2)  # [B, S, P * L]
+        filled = (within < sizes.unsqueeze(-1)).flatten(2)
+
+        layout = self.reordered_indices.unsqueeze(1).expand(batch_size, seq_len, -1)
+        indexed_len = layout.shape[-1]
+        candidates = layout.gather(-1, position.clamp(max=indexed_len - 1))
+
+        # Candidates stay in cluster order. Ordering them by cache position would only change which
+        # of several equally-scoring (ReLU-zeroed) keys wins a tie, and costs an O(M log M) sort.
+        return candidates.clamp(max=indexed_len - 1), filled
+
+    @torch.no_grad()
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        q_resid: torch.Tensor,
+        attention_mask: torch.BoolTensor,
+        past_key_values: Cache | None = None,
+    ) -> torch.LongTensor:
+        """
+        Selects the top-k tokens per query for DeepSeek Sparse Attention (DSA) by IVF probing.
+
+        Args:
+            hidden_states: Input hidden states `[B, S, hidden_size]`.
+            q_resid: Query residual from `q_a_layernorm(q_a_proj(x))`, shape `[B, S, q_lora_rank]`.
+            attention_mask: Local boolean padding mask of shape `[B, S]`.
+            past_key_values: Cache object containing the indexer state cache for this layer.
+
+        Returns:
+            `torch.Tensor`: the `int32` top-k token indices of shape `[B, S, index_topk]`, with `-1`
+            in unfilled ranks per the indexer convention.
+        """
+        batch_size, seq_len = hidden_states.shape[:2]
+        hidden_shape = (batch_size, seq_len, -1, self.head_dim)
+
+        q = self.wq_b(q_resid).view(hidden_shape)  # [B, S, H, D]
+        k = self.k_norm(self.wk(hidden_states)).view(hidden_shape).squeeze(2)  # [B, S, D]
+
+        # Pack exactly as the k-pool indexer does, so both share one cache layout and the valid
+        # channel carries padding status forward. The gate scores themselves go unused here.
+        gate_scores = F.linear(hidden_states, self.index_kpool_compress_gate)
+        valid_channel = attention_mask.to(k.dtype)[..., None]
+        packed_states = torch.cat([k, gate_scores, valid_channel], dim=-1)
+
+        current_length = seq_len
+        if past_key_values is not None:
+            packed_states = past_key_values.update_indexer(packed_states, self.layer_idx)
+            current_length = past_key_values.layers[self.layer_idx].get_seq_length()
+
+        keys, _, valid = torch.split(packed_states, [self.head_dim, self.head_dim, 1], dim=-1)
+        key_valid = valid.bool().squeeze(-1)  # [B, T]
+
+        weights = self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype)).float() * (self.n_heads**-0.5)
+        q, keys = q.float(), keys.float()
+
+        self._refresh_index(keys, key_valid, seq_len, current_length)
+        probes = self._probe(F.normalize(q, p=2, dim=-1), weights)
+        candidates, filled = self._gather_candidates(probes)  # [B, S, M]
+
+        # Score only the probed keys: [B, S, M, D] gathered, then [B, S, H, D] @ [B, S, D, M].
+        candidate_keys = (
+            keys.unsqueeze(1)
+            .expand(-1, seq_len, -1, -1)
+            .gather(2, candidates.unsqueeze(-1).expand(-1, -1, -1, keys.shape[-1]))
+        )
+        scores = F.relu(torch.matmul(q, candidate_keys.transpose(-1, -2)) * self.softmax_scale)
+
+        # Weight per head and sum across heads: [B, S, 1, H] @ [B, S, H, M] -> [B, S, M]
+        index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
+
+        # Drop unfilled slots, padding keys, and keys the query may not look back at. Query
+        # positions follow `get_visible_tokens`: the window ends at the current cache length.
+        query_pos = (current_length - seq_len + torch.arange(seq_len, device=keys.device)).view(1, seq_len, 1)
+        allowed = filled & (candidates <= query_pos)
+        allowed &= key_valid.unsqueeze(1).expand(-1, seq_len, -1).gather(-1, candidates)
+        index_scores = index_scores.masked_fill_(~allowed, float("-inf"))
+
+        topk = min(self.index_topk, candidates.shape[-1])
+        top_scores, top_slots = index_scores.topk(topk, dim=-1)
+        selected = candidates.gather(-1, top_slots)
+
+        # `-1` marks "nothing selected" here, as `build_attention_mask_from_topk` expects; unlike a
+        # repeated index it cannot hand a query a key it never selected.
+        selected = torch.where(top_scores > float("-inf"), selected, torch.full_like(selected, -1))
+
+        # A real query must keep at least one key. Probing can miss every visible key when few are
+        # visible — an early query under left padding, say — and an all `-1` row is fully masked,
+        # which SDPA resolves to NaN while eager returns a uniform average over the whole cache.
+        # Falling back to the query's own position, always visible to it, keeps attention defined.
+        # This is a well-formedness floor, not a recency window: it adds nothing when the probe
+        # already found a key.
+        empty = top_scores[..., :1] == float("-inf")
+        first = torch.where(empty, query_pos.expand_as(empty), selected[..., :1])
+        selected = torch.cat([first, selected[..., 1:]], dim=-1)
+
+        selected = F.pad(selected, (0, self.index_topk - selected.shape[-1]), value=-1)
+        return selected.masked_fill(~attention_mask[..., None], -1).to(torch.int32)  # [B, S, index_topk]
+
+
 class Glm5NextTextAttention(GlmMoeDsaAttention):
     def __init__(self, config: Glm5NextTextConfig, layer_idx: int):
         super().__init__(config, layer_idx)
@@ -1039,7 +1344,7 @@ class Glm5NextTextAttention(GlmMoeDsaAttention):
             Glm5NextTextRMSNorm(config.q_lora_rank, eps=config.rms_norm_eps) if self.q_lora_rank is not None else None
         )
         self.kv_a_layernorm = Glm5NextTextRMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        self.indexer = None if self.skip_topk else Glm5NextTextIndexer(config, layer_idx)
+        self.indexer = None if self.skip_topk else Glm5NextTextKmeansIndexer(config, layer_idx)
         self.next_skip_topk = (
             not self.skip_topk and config.indexer_types[min(layer_idx + 1, len(config.indexer_types) - 1)] == "shared"
         )

@@ -44,15 +44,6 @@ class GlmMoeDsaConfig(PreTrainedConfig):
         Per-layer indexer mode (`"full"` runs the indexer, `"shared"` reuses the previous full
         layer's top-k). Defaults to the pattern derived from `index_topk_freq` /
         `index_skip_topk_offset` (or `index_topk_pattern`).
-    index_num_clusters (`int`, *optional*, defaults to 512):
-        Number of K-Means clusters built over the indexer key cache for IVF top-k selection.
-    index_num_probes (`int`, *optional*, defaults to 64):
-        Number of clusters each query probes. The scanned fraction of the key cache is roughly
-        `index_num_probes / index_num_clusters`; setting the two equal recovers exact top-k.
-    index_kmeans_iters (`int`, *optional*, defaults to 10):
-        Number of K-Means iterations run when (re)building the index.
-    index_kmeans_seed (`int`, *optional*, defaults to 0):
-        Seed for K-Means centroid initialization, so clusterings are reproducible.
 
     ```python
     >>> from transformers import GlmMoeDsaConfig, GlmMoeDsaModel
@@ -140,11 +131,6 @@ class GlmMoeDsaConfig(PreTrainedConfig):
     layer_types: list[str] | None = None
     # `"full"` runs the indexer, `"shared"` reuses the previous full layer's index mask.
     indexer_types: list[str] | None = None
-    # IVF / K-Means top-k selection in the indexer (see `GlmMoeDsaIndexer`).
-    index_num_clusters: int = 512
-    index_num_probes: int = 64
-    index_kmeans_iters: int = 10
-    index_kmeans_seed: int = 0
 
     def __post_init__(self, **kwargs):
         # Per-layer indexer mode: a pattern (e.g. `"FSSF..."`) overrides the freq/offset schedule.
