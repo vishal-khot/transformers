@@ -42,6 +42,7 @@ from ...integrations import (
     use_kernelized_func,
 )
 from ...integrations.accelerate import force_accelerate_hooks
+from ...integrations.moe import _can_use_grouped_mm, _grouped_mm
 from ...masking_utils import create_recurrent_attention_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_outputs import BaseModelOutputWithPast, MoeCausalLMOutputWithPast, MoeModelOutputWithPast
@@ -1114,6 +1115,25 @@ class Glm5NextTextIndexer(GlmMoeDsaIndexer):
         return torch.cat([topk_indices, tail_indices], dim=-1)
 
 
+def _grouped_gemm(mat_a: torch.Tensor, mat_b: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
+    """
+    Jagged matrix product in the MoE expert layout: `out[r] = mat_a[r] @ mat_b[g]` for every row `r` of
+    group `g`, where group `g` owns rows `offs[g - 1]:offs[g]` of `mat_a` `[N, D]` and `mat_b` is
+    `[G, D, H]`. One grouped GEMM, with no row padded to the widest group.
+
+    The fused CUDA kernel only takes half-precision operands, so there they go in as bfloat16 -- the dtype
+    the indexer keys and queries are produced in, so nothing is lost -- and the products accumulate in FP32.
+    Elsewhere the operands stay FP32, through `grouped_mm` where it runs or its per-group `mm` fallback.
+
+    Returns:
+        `torch.Tensor`: FP32 `[N, H]`.
+    """
+    if mat_a.device.type == "cuda" and _can_use_grouped_mm(mat_a, mat_b, offs):
+        grouped_mm = getattr(F, "grouped_mm", None) or torch._grouped_mm
+        return grouped_mm(mat_a.to(torch.bfloat16), mat_b.to(torch.bfloat16), offs=offs, out_dtype=torch.float32)
+    return _grouped_mm(mat_a.float(), mat_b.float(), offs)
+
+
 class Glm5NextTextKmeansIndexer(Glm5NextTextIndexer):
     """
     [`Glm5NextTextIndexer`] with IVF top-k selection instead of k-pool compression.
@@ -1206,47 +1226,142 @@ class Glm5NextTextKmeansIndexer(Glm5NextTextIndexer):
         """
         num_probes = min(self.num_probes, self.centroids.shape[1])
         cluster_scores = torch.matmul(q, self.centroids.unsqueeze(1).transpose(-1, -2))  # [B, S, H, C]
-        cluster_scores = F.relu(cluster_scores)
+        cluster_scores = cluster_scores.relu_()  # in place: this [B, S, H, C] buffer is large at prefill
 
         # Combine across heads exactly as the key scores are combined: [B, S, 1, H] @ [B, S, H, C]
         probe_scores = torch.matmul(weights.unsqueeze(-2), cluster_scores).squeeze(-2)  # [B, S, C]
         return probe_scores.topk(num_probes, dim=-1).indices
 
-    def _gather_candidates(self, probes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _gather_candidates(
+        self, probes: torch.Tensor, key_valid: torch.Tensor, current_length: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Expand probed clusters into the key indices they contain.
+        Expand probed clusters into the keys each query may attend, as one jagged list.
 
-        Each probed cluster gets its own slot of `L` entries, `L` being the widest cluster this
-        batch probes, so a query's candidates live in a `[P, L]` block that is simply flattened —
-        clusters shorter than `L` leave their tail unfilled. Sizing by the widest cluster rather
-        than by a running candidate total keeps the layout a direct image of "probe `P` clusters".
+        Each (query, probed cluster) pair contributes that cluster's contiguous run of the layout, so a
+        query's candidates are exactly the keys of the clusters it probes: nothing is sized by the widest
+        cluster and nothing is padded. Keys the query may not look back at (later positions, padding) are
+        dropped here rather than scored and masked afterwards.
 
         Args:
             probes: Clusters probed by each query, `[B, S, P]`.
+            key_valid: `True` for real cached keys, `[B, T]`.
+            current_length: Cache length; a query's window ends there, as in `get_visible_tokens`.
 
         Returns:
-            `tuple[torch.Tensor, torch.Tensor]`: candidate key indices `[B, S, P * L]` and a bool
-                mask marking the slots that hold a real candidate.
+            `tuple[torch.Tensor, torch.Tensor, torch.Tensor]`: the cache position of every candidate `[N]`;
+                the query it belongs to, flattened as `b * S + s` and non-decreasing, `[N]`; and each
+                query's candidate count, `[B * S]`.
         """
-        batch_size, seq_len = probes.shape[:2]
-        offsets = self.cluster_offsets.unsqueeze(1).expand(batch_size, seq_len, -1)
-        starts = offsets.gather(-1, probes)  # [B, S, P] first slot of each probed cluster
-        sizes = offsets.gather(-1, probes + 1) - starts
+        batch_size, seq_len, num_probes = probes.shape
+        device = probes.device
 
-        # Slot width is the widest cluster this batch actually probes, read off the device so it
-        # is exact rather than an upper bound that drifts as decode grows the clusters. At least one
-        # slot is kept so a query probing only empty clusters still yields a well-formed buffer.
-        within = torch.arange(max(int(sizes.max()), 1), device=probes.device)  # [L]
-        position = (starts.unsqueeze(-1) + within).flatten(2)  # [B, S, P * L]
-        filled = (within < sizes.unsqueeze(-1)).flatten(2)
+        flat_probes = probes.flatten(1)  # [B, S * P]
+        starts = self.cluster_offsets.gather(-1, flat_probes).flatten()  # [B * S * P] first slot of each run
+        sizes = self.cluster_offsets.gather(-1, flat_probes + 1).flatten() - starts
 
-        layout = self.reordered_indices.unsqueeze(1).expand(batch_size, seq_len, -1)
-        indexed_len = layout.shape[-1]
-        candidates = layout.gather(-1, position.clamp(max=indexed_len - 1))
+        # One host sync sizes the jagged buffer. Each entry then knows its (query, cluster) run and its
+        # slot in the cluster-contiguous layout.
+        total = int(sizes.sum())
+        run = torch.repeat_interleave(sizes, output_size=total)  # [total]
+        run_start = sizes.cumsum(0) - sizes
+        slot = starts[run] + torch.arange(total, device=device) - run_start[run]
+        batch = run // (seq_len * num_probes)
+        query = run // num_probes
+        position = self.reordered_indices[batch, slot]
 
-        # Candidates stay in cluster order. Ordering them by cache position would only change which
-        # of several equally-scoring (ReLU-zeroed) keys wins a tie, and costs an O(M log M) sort.
-        return candidates.clamp(max=indexed_len - 1), filled
+        query_pos = current_length - seq_len + query % seq_len
+        allowed = (position <= query_pos) & key_valid[batch, position]
+        kept = allowed.nonzero().squeeze(-1)  # one host sync sizes the compacted list
+        position, query = position[kept], query[kept]
+        # `query` is sorted, so a query's run ends where the next query id would be inserted: no
+        # data-dependent `bincount`.
+        ends = torch.searchsorted(query, torch.arange(1, batch_size * seq_len + 1, device=device))
+        counts = torch.diff(ends, prepend=ends.new_zeros(1))
+        return position, query, counts
+
+    def _score_candidates(
+        self,
+        q: torch.Tensor,
+        keys: torch.Tensor,
+        weights: torch.Tensor,
+        position: torch.Tensor,
+        query: torch.Tensor,
+        counts: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        FP32 index scores of the jagged candidates, `[N]`.
+
+        As in the dense indexer, each head's scaled dot product with a key is ReLU'd and the query's head
+        weights combine them, but only probed keys are scored. The query-key products are one grouped GEMM
+        in the MoE expert layout: the candidates, packed query by query, are the rows, and each query's
+        heads `[D, H]` are its group's matrix.
+
+        Args:
+            q: Queries `[B, S, H, D]`, in the dtype they were projected in (see `_grouped_gemm`).
+            keys: Indexer key cache `[B, T, D]`, likewise.
+            weights: FP32 per-head weights `[B, S, H]`.
+            position, query, counts: The candidates, as returned by `_gather_candidates`.
+        """
+        seq_len, head_dim = q.shape[1], q.shape[-1]
+        num_queries = counts.shape[0]
+        if position.numel() == 0:
+            return weights.new_zeros(0)
+        offs = counts.cumsum(0).to(torch.int32)
+        queries = q.reshape(num_queries, -1, head_dim).transpose(-1, -2)  # [B * S, D, H]
+        # The gathered keys `[N, D]` are the largest buffer on this path; passed straight in, they are
+        # freed as soon as the products exist.
+        scores = _grouped_gemm(keys[query // seq_len, position], queries, offs)  # [N, H]
+        scores = scores.mul_(self.softmax_scale).relu_()
+        return scores.mul_(weights.reshape(num_queries, -1).index_select(0, query)).sum(-1)
+
+    def _select_topk(
+        self,
+        index_scores: torch.Tensor | None,
+        position: torch.Tensor,
+        query: torch.Tensor,
+        counts: torch.Tensor,
+        max_count: int,
+        batch_size: int,
+        seq_len: int,
+        current_length: int,
+    ) -> torch.Tensor:
+        """
+        The `index_topk` best candidates of each query, `[B, S, index_topk]`.
+
+        Without scores -- no query has more candidates than the budget -- every candidate is kept, in probe
+        order, at its offset within its query's run. Otherwise the jagged scores are laid out one scalar per
+        slot as `[B * S, max_count]`, sized by the longest candidate list rather than by the widest cluster,
+        and each row keeps its `index_topk` best. Unfilled ranks hold `-1`, as
+        `build_attention_mask_from_topk` expects; unlike a repeated index it cannot hand a query a key it
+        never selected.
+        """
+        device = position.device
+        num_queries, budget = counts.shape[0], self.index_topk
+        starts = counts.cumsum(0) - counts
+        rank = torch.arange(position.shape[0], device=device) - starts[query]  # offset within the query's run
+        selected = torch.full((num_queries, budget), -1, dtype=position.dtype, device=device)
+        if index_scores is None:
+            selected[query, rank] = position
+        else:
+            padded = index_scores.new_full((num_queries, max_count), float("-inf"))
+            padded[query, rank] = index_scores
+            top_scores, top_slots = padded.topk(budget, dim=-1, sorted=False)
+            del padded
+            taken = (starts.unsqueeze(-1) + top_slots).clamp_(max=position.shape[0] - 1)
+            selected = torch.where(top_scores > float("-inf"), position[taken], selected)
+        selected = selected.view(batch_size, seq_len, budget)
+
+        # A real query must keep at least one key. Probing can miss every visible key when few are
+        # visible — an early query under left padding, say — and an all `-1` row is fully masked,
+        # which SDPA resolves to NaN while eager returns a uniform average over the whole cache.
+        # Falling back to the query's own position, always visible to it, keeps attention defined.
+        # This is a well-formedness floor, not a recency window: it adds nothing when the probe
+        # already found a key.
+        query_pos = current_length - seq_len + torch.arange(seq_len, device=device)
+        empty = counts.view(batch_size, seq_len) == 0
+        selected[..., 0] = torch.where(empty, query_pos, selected[..., 0])
+        return selected
 
     @torch.no_grad()
     def forward(
@@ -1290,49 +1405,21 @@ class Glm5NextTextKmeansIndexer(Glm5NextTextIndexer):
         key_valid = valid.bool().squeeze(-1)  # [B, T]
 
         weights = self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype)).float() * (self.n_heads**-0.5)
-        q, keys = q.float(), keys.float()
-
+        # `q` / `keys` stay as projected: the index and the probes upcast what they need to FP32, and
+        # `_grouped_gemm` hands them to its kernel without another copy.
         self._refresh_index(keys, key_valid, seq_len, current_length)
-        probes = self._probe(F.normalize(q, p=2, dim=-1), weights)
-        candidates, filled = self._gather_candidates(probes)  # [B, S, M]
+        probes = self._probe(F.normalize(q.float(), p=2, dim=-1), weights)
+        position, query, counts = self._gather_candidates(probes, key_valid, current_length)  # jagged [N]
 
-        # Score only the probed keys: [B, S, M, D] gathered, then [B, S, H, D] @ [B, S, D, M].
-        candidate_keys = (
-            keys.unsqueeze(1)
-            .expand(-1, seq_len, -1, -1)
-            .gather(2, candidates.unsqueeze(-1).expand(-1, -1, -1, keys.shape[-1]))
+        # Scores only order candidates within a query. While no query has more of them than the budget, all
+        # are selected whatever they score, so scoring is skipped; one host sync decides.
+        max_count = int(counts.max())
+        index_scores = None
+        if max_count > self.index_topk:
+            index_scores = self._score_candidates(q, keys, weights, position, query, counts)
+        selected = self._select_topk(
+            index_scores, position, query, counts, max_count, batch_size, seq_len, current_length
         )
-        scores = F.relu(torch.matmul(q, candidate_keys.transpose(-1, -2)) * self.softmax_scale)
-
-        # Weight per head and sum across heads: [B, S, 1, H] @ [B, S, H, M] -> [B, S, M]
-        index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
-
-        # Drop unfilled slots, padding keys, and keys the query may not look back at. Query
-        # positions follow `get_visible_tokens`: the window ends at the current cache length.
-        query_pos = (current_length - seq_len + torch.arange(seq_len, device=keys.device)).view(1, seq_len, 1)
-        allowed = filled & (candidates <= query_pos)
-        allowed &= key_valid.unsqueeze(1).expand(-1, seq_len, -1).gather(-1, candidates)
-        index_scores = index_scores.masked_fill_(~allowed, float("-inf"))
-
-        topk = min(self.index_topk, candidates.shape[-1])
-        top_scores, top_slots = index_scores.topk(topk, dim=-1)
-        selected = candidates.gather(-1, top_slots)
-
-        # `-1` marks "nothing selected" here, as `build_attention_mask_from_topk` expects; unlike a
-        # repeated index it cannot hand a query a key it never selected.
-        selected = torch.where(top_scores > float("-inf"), selected, torch.full_like(selected, -1))
-
-        # A real query must keep at least one key. Probing can miss every visible key when few are
-        # visible — an early query under left padding, say — and an all `-1` row is fully masked,
-        # which SDPA resolves to NaN while eager returns a uniform average over the whole cache.
-        # Falling back to the query's own position, always visible to it, keeps attention defined.
-        # This is a well-formedness floor, not a recency window: it adds nothing when the probe
-        # already found a key.
-        empty = top_scores[..., :1] == float("-inf")
-        first = torch.where(empty, query_pos.expand_as(empty), selected[..., :1])
-        selected = torch.cat([first, selected[..., 1:]], dim=-1)
-
-        selected = F.pad(selected, (0, self.index_topk - selected.shape[-1]), value=-1)
         return selected.masked_fill(~attention_mask[..., None], -1).to(torch.int32)  # [B, S, index_topk]
 
 
