@@ -1119,7 +1119,28 @@ def _grouped_gemm(mat_a: torch.Tensor, mat_b: torch.Tensor, offs: torch.Tensor) 
     """
     if mat_a.device.type == "cuda" and _can_use_grouped_mm(mat_a, mat_b, offs):
         grouped_mm = getattr(F, "grouped_mm", None) or torch._grouped_mm
-        return grouped_mm(mat_a.to(torch.bfloat16), mat_b.to(torch.bfloat16), offs=offs, out_dtype=torch.float32)
+        # torch._grouped_mm requires out_dtype to match the (bf16) input dtype; it already
+        # accumulates in FP32 internally, so feed bf16 operands and upcast the output.
+        a, b = mat_a.to(torch.bfloat16), mat_b.to(torch.bfloat16)
+        num_groups = b.shape[0]
+        # The fused kernel processes at most 1024 groups per call, and there is one group per
+        # query, so a long prefill (S > 1024) overflows it. Groups are independent, so split the
+        # group axis into blocks -- slice mat_a's rows by the block's offset range, re-base offs
+        # to the block, then concatenate. FLOPs and results are unchanged. (This torch build's
+        # cap is exclusive of 1024, so stay safely under it; 512 still saturates the GPU.)
+        max_groups = 512
+        if num_groups <= max_groups:
+            return grouped_mm(a, b, offs=offs, out_dtype=torch.bfloat16).to(torch.float32)
+        chunks, row_start = [], 0
+        for g0 in range(0, num_groups, max_groups):
+            g1 = min(g0 + max_groups, num_groups)
+            row_end = int(offs[g1 - 1])
+            offs_chunk = (offs[g0:g1] - row_start).to(torch.int32)
+            chunks.append(
+                grouped_mm(a[row_start:row_end], b[g0:g1], offs=offs_chunk, out_dtype=torch.bfloat16)
+            )
+            row_start = row_end
+        return torch.cat(chunks, dim=0).to(torch.float32)
     return _grouped_mm(mat_a.float(), mat_b.float(), offs)
 
 
